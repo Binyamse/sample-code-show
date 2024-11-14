@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+
+import os
+import subprocess
+import sys
+import argparse
+import re
+from typing import Optional
+from google.cloud import secretmanager
+from google.api_core.exceptions import NotFound, GoogleAPICallError, RetryError
+
+# Module-level constants
+DEFAULT_PROJECT_ID = "608470820486"
+DEFAULT_USERNAME_SECRET_ID = "PYPI_USER_NAME"
+DEFAULT_PASSWORD_SECRET_ID = "PYPI_PASSWORD"
+USERNAME_ENV_VAR_KEY = "PYPI_USER"
+PASSWORD_ENV_VAR_KEY = "PYPI_PASS"
+BUILD_WORK_DIR = os.environ.get('BUILD_WORK_DIR')
+DEPLOY_SCRIPT_DIR = os.path.join(BUILD_WORK_DIR, 'local-deployment')
+DEFAULT_PROCESS_TIMEOUT_SECONDS = 900
+JENKINS_REPO_PATH = os.path.join(BUILD_WORK_DIR, 'jenkins-shared/resources//jenkins')
+TEST_ARTIFACTS = ['setup_buildx.sh', 'run_tests.sh', 'main_test.sh']
+TARGET_DIR = f'{BUILD_WORK_DIR}/{{release_name}}'
+
+class NovaTestExecutionException(Exception):
+    """General exception class"""
+
+def cleanup_on_exit(release_name: str) -> None:
+    """Attempt to remove build & test artifacts upon test exit."""
+    target_dir = TARGET_DIR.format(release_name=release_name)
+    for each_item in TEST_ARTIFACTS:
+        current_item_path = os.path.join(target_dir, each_item)
+        if os.path.exists(current_item_path):
+            os.remove(current_item_path)
+
+def access_secret_version(project_id: str, secret_id: str, version_id: str = 'latest') -> Optional[str]:
+    """Access the payload for the given secret version if one exists."""
+    client = secretmanager.SecretManagerServiceClient()
+    name = f'projects/{project_id}/secrets/{secret_id}/versions/{version_id}'
+
+    try:
+        response = client.access_secret_version(request={'name': name})
+        return response.payload.data.decode('UTF-8')
+    except NotFound:
+        print(f'Secret {secret_id} not found in project {project_id}.')
+        return None
+    except GoogleAPICallError as e:
+        print(f'API call error occurred: {e}')
+        return None
+    except RetryError as e:
+        print(f'Retry error occurred: {e}')
+        return None
+    except Exception as e:
+        print(f'An unexpected error occurred: {e}')
+        return None
+
+def get_env_variable(project_id: str, secret_id: str) -> Optional[str]:
+    """Retrieve a secret from Google Secret Manager."""
+    secret_value = access_secret_version(project_id, secret_id)
+    if secret_value is not None:
+        return secret_value
+    else:
+        print(f"Failed to retrieve secret {secret_id}.")
+        return None
+
+def _obtain_value_from_jenkinsfile(jenkinsfile_path: str, pattern: str, group: int) -> str:
+    """Using regex, capture first instance of pattern in the Jenkinsfile and return the capture group at group."""
+    test_settings_pattern = re.compile(pattern)
+    try:
+        with open(jenkinsfile_path, "r") as file:
+            for line in file:
+                capture = test_settings_pattern.findall(line)
+                if capture:
+                    return capture[0][group]
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Jenkinsfile not found at {jenkinsfile_path}")
+
+def check_integration_tests(jenkinsfile_path: str) -> str:
+    """Check the Jenkinsfile for INTEGRATION_TESTS=True and return the appropriate value."""
+    return _obtain_value_from_jenkinsfile(
+        jenkinsfile_path,
+        r".*(INTEGRATION_TESTS)\s{0,1}=\s{0,1}['\"]{0,1}(True|False)['\"]{0,1}",
+        1
+    )
+
+def get_requirements_file(jenkinsfile_path: str) -> str:
+    """Check the Jenkinsfile for TEST_REQUIREMENTS return the appropriate value."""
+    return _obtain_value_from_jenkinsfile(
+        jenkinsfile_path,
+        r".*(TEST_REQUIREMENTS)\s{0,1}=\s{0,1}['\"]{0,1}(.*\.txt)['\"]{0,1}",
+        1
+    )
+
+def get_docker_file_location(jenkinsfile_path: str) -> str:
+    """Check the Jenkinsfile for DOCKERFILE_LOCATION and return the appropriate value."""
+    return _obtain_value_from_jenkinsfile(
+        jenkinsfile_path,
+        r".*(DOCKERFILE_LOCATION)\s{0,1}=\s{0,1}['\"]{0,1}(.*/Dockerfile)['\"]{0,1}",
+        1
+    )
+
+def _display_process_output(process_instance: subprocess.Popen) -> None:
+    """Display real-time output from the process instance."""
+    for line in process_instance.stdout:
+        sys.stdout.write(line)
+
+def execute_shell_script(shell_script_arguments: str, additional_env: dict) -> int:
+    """Execute the shell script with the given argument and provide real-time feedback."""
+    shell_script = os.path.join(JENKINS_REPO_PATH, "main_test.sh")
+    if not os.path.exists(shell_script):
+        print(f"Error: Shell script {shell_script} not found.")
+        return 1
+    
+    script_env = os.environ.copy()
+    script_env.update(additional_env)
+
+    process = subprocess.Popen(
+        f"{shell_script} {shell_script_arguments}",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        shell=True,
+        text=True,
+        env=script_env,
+    )
+
+    _display_process_output(process_instance=process)
+    process.communicate()
+
+    return process.returncode
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run  local workflows or manage Minikube services.")
+    
+    # Define arguments for main operations
+    parser.add_argument('--deploy', type=str, help="Deploy a service")
+    parser.add_argument('--deploy-group', type=str, help="Deploy a group of  services")
+    parser.add_argument('--tools', nargs='+', choices=['mongo', 'elastic', 'redis', 'istio', 'prometheus', 'all'], help="Deploy specific tools to Minikube")
+    parser.add_argument('--cicd', choices=['all', 'secret', 'configmap'], help="Deploy CI/CD related configurations to Minikube")
+    parser.add_argument('--remove-tools', nargs='+', choices=['mongo', 'elastic', 'redis', 'istio', 'prometheus', 'all'], help="Remove specific tools from Minikube")
+    parser.add_argument('--build-test', type=str, help="Run build-test for a service")
+
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # Independent subparser for removing a service
+    remove_service_parser = subparsers.add_parser('remove', help='Remove a specific service')
+    remove_service_parser.add_argument('service_name', type=str, help="Name of the service to remove")
+
+    # Subparsers for stop, start, reset commands
+    subparsers.add_parser('stop', help='Stop Minikube')
+    subparsers.add_parser('start', help='Start Minikube')
+    subparsers.add_parser('reset', help='Reset all Minikube components')
+
+    return parser.parse_args()
+
+def main_logic(service_name: str) -> int:
+    """Main function to set environment variables and execute the shell script. Returns integer exit code from test execution script."""
+    if not BUILD_WORK_DIR:
+        raise NovaTestExecutionException("Error: BUILD_WORK_DIR is not set. Please set this value and try again.")
+
+    project_id = os.getenv("GCP_PROJECT_ID", DEFAULT_PROJECT_ID)
+    username_secret_id = os.getenv("USERNAME_SECRET_ID", DEFAULT_USERNAME_SECRET_ID)
+    password_secret_id = os.getenv("PASSWORD_SECRET_ID", DEFAULT_PASSWORD_SECRET_ID)
+
+    username = get_env_variable(project_id, username_secret_id)
+    password = get_env_variable(project_id, password_secret_id)
+
+    if username is None or password is None:
+        print("Error: Unable to retrieve required secrets.")
+        return 1
+
+    additional_env = {
+        USERNAME_ENV_VAR_KEY: username,
+        PASSWORD_ENV_VAR_KEY: password
+    }
+
+    os.environ["BUILD_WORK_DIR"] = BUILD_WORK_DIR
+    print(f"Environment variable BUILD_WORK_DIR set to {BUILD_WORK_DIR}")
+
+    jenkinsfile_path = os.path.join(BUILD_WORK_DIR, f"{service_name}", "Jenkinsfile")
+
+    additional_env["INTEGRATION_TESTS"] = check_integration_tests(jenkinsfile_path) or "False"
+    print(f"Environment variable INTEGRATION_TESTS set to {additional_env['INTEGRATION_TESTS']}")
+    requirements_file = get_requirements_file(jenkinsfile_path)
+    print(f"Requirements file is {requirements_file}")
+    docker_file_location = get_docker_file_location(jenkinsfile_path)
+    print(f"Docker file location is {docker_file_location}")
+
+    exit_code = execute_shell_script(
+        f"{service_name} {docker_file_location} {requirements_file}",
+        additional_env
+    )
+
+    return exit_code
+
+def deploy_tools(tools):
+    """Deploy specific tools to Minikube."""
+    for tool in tools:
+        print(f"Deploying tool: {tool}")
+        deploy_cmd = ['python3', os.path.join(DEPLOY_SCRIPT_DIR, 'local_deploy_tools'), '--deploy-tools', tool]
+        try:
+            subprocess.check_call(deploy_cmd)
+        except FileNotFoundError:
+            print("Error: local_deploy_tools script not found.")
+            sys.exit(1)
+        except subprocess.CalledProcessError as e:
+            print(f"Error while running local_deploy_tools: {e}")
+            sys.exit(1)
+
+def remove_tools(tools):
+    """Remove specific tools from Minikube."""
+    for tool in tools:
+        print(f"Removing tool: {tool}")
+        remove_cmd = ['python3', os.path.join(DEPLOY_SCRIPT_DIR, 'local_deploy_tools'), '--remove-tools', tool]
+        try:
+            subprocess.check_call(remove_cmd)
+        except FileNotFoundError:
+            print("Error: local_deploy_tools script not found.")
+            sys.exit(1)
+        except subprocess.CalledProcessError as e:
+            print(f"Error while running local_deploy_tools: {e}")
+            sys.exit(1)
+
+def deploy_cicd(cicd_config):
+    """Deploy CI/CD configurations to Minikube."""
+    print(f"Deploying CI/CD configurations: {cicd_config}")
+    deploy_cmd = ['python3', os.path.join(DEPLOY_SCRIPT_DIR, 'local_deploy_cicd'), cicd_config]
+    try:
+        subprocess.check_call(deploy_cmd)
+    except FileNotFoundError:
+        print("Error: local_deploy_cicd script not found.")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"Error while running local_deploy_cicd: {e}")
+        sys.exit(1)
+
+def remove_service(service_name):
+    """Remove a specific service."""
+    print(f"Removing service: {service_name}")
+    remove_cmd = ['python3', os.path.join(DEPLOY_SCRIPT_DIR, 'local_deploy_service'), 'remove', service_name]
+    try:
+        subprocess.check_call(remove_cmd)
+    except FileNotFoundError:
+        print("Error: local_deploy_service script not found.")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"Error while running local_deploy_service: {e}")
+        sys.exit(1)
+
+def deploy_services(deploy_target):
+    """Deploy specified services or groups."""
+    if deploy_target:
+        if deploy_target.startswith('group'):
+            group_name = deploy_target.split("group ", 1)[1]
+            print(f"Deploying group: {group_name}")
+            deploy_cmd = ['python3', os.path.join(DEPLOY_SCRIPT_DIR, 'local_deploy_service'), 'group', group_name]
+        else:
+            print(f"Deploying service: {deploy_target}")
+            deploy_cmd = ['python3', os.path.join(DEPLOY_SCRIPT_DIR, 'local_deploy_service'), 'service', deploy_target]
+
+        try:
+            subprocess.check_call(deploy_cmd)
+        except FileNotFoundError:
+            print("Error: local_deploy_service script not found.")
+            sys.exit(1)
+        except subprocess.CalledProcessError as e:
+            print(f"Error while running local_deploy_service: {e}")
+            sys.exit(1)
+
+def stop_minikube():
+    """Stop Minikube."""
+    print("Stopping Minikube...")
+    try:
+        subprocess.check_call(['minikube', 'stop'])
+    except FileNotFoundError:
+        print("Error: Minikube not found.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error while stopping Minikube: {e}")
+
+def start_minikube():
+    """Start Minikube."""
+    print("Starting Minikube...")
+    try:
+        subprocess.check_call(['minikube', 'start'])
+    except FileNotFoundError:
+        print("Error: Minikube not found.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error while starting Minikube: {e}")
+
+def reset_minikube_components():
+    """Reset all Minikube components."""
+    print("Resetting all Minikube components...")
+    try:
+        subprocess.check_call(['minikube', 'delete'])
+    except FileNotFoundError:
+        print("Error: Minikube not found.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error while deleting Minikube: {e}")
+
+def main():
+    args = parse_args()
+
+    # Execute operations in a specified logical order
+    if args.build_test:
+        main_logic(args.build_test)
+
+    if args.deploy:
+        deploy_services(args.deploy)
+
+    if args.deploy_group:
+        deploy_services(f"group {args.deploy_group}")
+
+    if args.tools:
+        deploy_tools(args.tools)
+
+    if args.remove_tools:
+        remove_tools(args.remove_tools)
+
+    if args.cicd:
+        deploy_cicd(args.cicd)
+
+    # Handle subcommand operations
+    if args.command == 'remove':
+        remove_service(args.service_name)
+
+    elif args.command == 'stop':
+        stop_minikube()
+
+    elif args.command == 'start':
+        start_minikube()
+
+    elif args.command == 'reset':
+        reset_minikube_components()
+
+if __name__ == "__main__":
+    main()
